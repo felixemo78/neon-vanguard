@@ -391,13 +391,66 @@
 
   // ---------------------------------------------------------------- input
   var keys = Object.create(null);
+  // dash is polled in update(), which hit-stop skips; remember the press so a quick tap isn't lost
+  var dashQueued = false;
   var mouse = { x: 0, y: 0, down: false, active: false };
-  var touch = { moveId: null, mx: 0, my: 0, mvx: 0, mvy: 0, aimId: null, ax: 0, ay: 0, avx: 0, avy: 0, ox: 0, oy: 0 };
+  var touch = { moveId: null, mx: 0, my: 0, mvx: 0, mvy: 0, aimId: null, ax: 0, ay: 0, avx: 0, avy: 0, ox: 0, oy: 0, buttons: {} };
+
+  // ---------------------------------------------------------------- mobile controls
+  // pointer:coarse means the main input is a finger; a touch laptop driven by mouse stays desktop
+  G.mobile = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+
+  // sticks bottom-left/right, action arc above-left of the aim stick, weapon above the move stick
+  function touchLayout(w, h) {
+    var r = clamp(Math.min(w, h) * 0.16, 48, 80), br = 30, d = r + br + 12;
+    var move = { x: r + 28, y: h - r - 28, r: r };
+    var aim = { x: w - r - 28, y: h - r - 28, r: r };
+    function arc(id, ang) { return { id: id, x: aim.x + Math.cos(ang) * d, y: aim.y + Math.sin(ang) * d, r: br }; }
+    return {
+      move: move, aim: aim,
+      buttons: [
+        arc('dash', Math.PI), arc('mine', Math.PI * 1.25), arc('od', Math.PI * 1.5),
+        { id: 'weapon', x: move.x, y: move.y - d, r: br },
+        { id: 'pause', x: w - br - 16, y: 150, r: br }
+      ]
+    };
+  }
+
+  function touchButtonAt(x, y) {
+    var b = touchLayout(W, H).buttons;
+    for (var i = 0; i < b.length; i++) if (dist(x, y, b[i].x, b[i].y) <= b[i].r) return b[i].id;
+    return null;
+  }
+
+  // cycle to the next unlocked weapon; with only PULSE unlocked it stays put
+  function nextWeapon() {
+    var p = G.player;
+    if (!p) return;
+    for (var i = 1; i < WEAPONS.length; i++) {
+      var j = (p.weapon + i) % WEAPONS.length;
+      if (p.unlocked[j]) { selectWeapon(j); return; }
+    }
+  }
+
+  function pressTouchButton(id) {
+    if (id === 'pause') {
+      if (G.state === 'playing') G.state = 'paused';
+      else if (G.state === 'paused') G.state = 'playing';
+      sfx.ui();
+      return;
+    }
+    if (G.state !== 'playing') return;
+    if (id === 'dash') { keys[' '] = true; dashQueued = true; } // held until the finger lifts, same as the space bar latch
+    else if (id === 'mine') placeMine();
+    else if (id === 'od') tryOverdrive();
+    else if (id === 'weapon') nextWeapon();
+  }
 
   window.addEventListener('keydown', function (e) {
     var k = e.key.toLowerCase();
     var wasDown = !!keys[k];
     keys[k] = true;
+    if (k === ' ' && !wasDown && G.state === 'playing') dashQueued = true;
     if ([' ', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].indexOf(e.key) >= 0) e.preventDefault();
 
     if (G.state === 'upgrade') {
@@ -499,9 +552,15 @@
       startGame(); return;
     }
     if (G.state === 'over' && G.gameOverT > 0.8) { startGame(); return; }
+    if (G.state !== 'playing' && G.state !== 'paused') return; // e.g. the first 0.8 s of game over
+    G.mobile = true;
+    // no Escape key on a phone: any tap resumes
+    if (G.state === 'paused') { pressTouchButton('pause'); return; }
     for (var i = 0; i < e.changedTouches.length; i++) {
       var t = e.changedTouches[i];
       var p = tpos(t, r);
+      var btn = touchButtonAt(p.x, p.y);
+      if (btn) { touch.buttons[t.identifier] = btn; pressTouchButton(btn); continue; }
       if (p.x < W * 0.5 && touch.moveId === null) {
         touch.moveId = t.identifier;
         touch.ox = p.x; touch.oy = p.y; touch.mvx = 0; touch.mvy = 0;
@@ -534,6 +593,11 @@
   function touchEnd(e) {
     for (var i = 0; i < e.changedTouches.length; i++) {
       var id = e.changedTouches[i].identifier;
+      if (touch.buttons[id]) {
+        if (touch.buttons[id] === 'dash') keys[' '] = false;
+        delete touch.buttons[id];
+        continue;
+      }
       if (id === touch.moveId) { touch.moveId = null; touch.mvx = 0; touch.mvy = 0; }
       if (id === touch.aimId) { touch.aimId = null; touch.avx = 0; touch.avy = 0; }
     }
@@ -1726,8 +1790,11 @@
     steerBank(p, p.angle, dt);
 
     // dash (charge based, latched to one per press)
-    var wantDash = !!(keys[' '] || keys['Spacebar']);
-    if (wantDash && !p.dashLatch && p.dashCharges > 0 && p.dashT <= 0) {
+    var held = !!keys[' '];
+    // a queued press is always a fresh press, even if the old latch never saw the release
+    var wantDash = dashQueued || (held && !p.dashLatch);
+    dashQueued = false;
+    if (wantDash && p.dashCharges > 0 && p.dashT <= 0) {
       var dirx = inp.x, diry = inp.y;
       if (len(dirx, diry) < 0.1) { dirx = Math.cos(p.angle); diry = Math.sin(p.angle); }
       var dl = len(dirx, diry) || 1;
@@ -1739,7 +1806,7 @@
       sfx.dash();
       addRing(p.x, p.y, 42, '#7dfcff', 0.3, 3);
     }
-    p.dashLatch = wantDash;
+    p.dashLatch = held;
 
     var accel = 3400 * p.spdMul, maxSpd = 340 * p.spdMul;
     if (p.dashT > 0) {
@@ -2824,6 +2891,56 @@
     ctx.restore();
   }
 
+  function drawTouchControls() {
+    var p = G.player;
+    if (!p) return;
+    var L = touchLayout(W, H);
+    function stick(base, active, cx, cy, kx, ky, col) {
+      ctx.save();
+      ctx.globalAlpha = active ? 0.9 : 0.4;
+      ctx.strokeStyle = withAlpha(col, 0.7); ctx.lineWidth = 2;
+      ctx.fillStyle = 'rgba(6,11,20,0.35)';
+      ctx.beginPath(); ctx.arc(cx, cy, base.r, 0, TAU); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = withAlpha(col, 0.55);
+      ctx.beginPath(); ctx.arc(kx, ky, base.r * 0.42, 0, TAU); ctx.fill();
+      ctx.restore();
+    }
+    // floating sticks sit where the thumb landed; idle ones show their home spot
+    var mv = touch.moveId !== null;
+    var mcx = mv ? touch.ox : L.move.x, mcy = mv ? touch.oy : L.move.y;
+    stick(L.move, mv, mcx, mcy, mcx + touch.mvx * L.move.r * 0.6, mcy + touch.mvy * L.move.r * 0.6, PLAYER_LOOK.engine);
+    var am = touch.aimId !== null;
+    var acx = am ? touch.ax : L.aim.x, acy = am ? touch.ay : L.aim.y;
+    stick(L.aim, am, acx, acy, acx + touch.avx * L.aim.r * 0.6, acy + touch.avy * L.aim.r * 0.6, '#ff5a7a');
+
+    var unlocked = p.unlocked.filter(function (u) { return u; }).length;
+    var ready = { dash: p.dashCharges > 0, mine: p.mines > 0, od: p.odReady || p.odActive > 0, weapon: unlocked > 1, pause: true };
+    var col = { dash: '#7dfcff', mine: '#fbbf24', od: '#7dfcff', weapon: WEAPONS[p.weapon].color, pause: '#e6faff' };
+    L.buttons.forEach(function (b) {
+      var pressed = false;
+      for (var k in touch.buttons) if (touch.buttons[k] === b.id) pressed = true;
+      ctx.save();
+      ctx.globalAlpha = ready[b.id] ? (pressed ? 1 : 0.85) : 0.35;
+      ctx.fillStyle = pressed ? withAlpha(col[b.id], 0.3) : 'rgba(6,11,20,0.6)';
+      ctx.strokeStyle = col[b.id]; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, TAU); ctx.fill(); ctx.stroke();
+      ctx.translate(b.x, b.y);
+      if (b.id === 'pause') {
+        ctx.fillStyle = col.pause;
+        ctx.fillRect(-7, -9, 5, 18); ctx.fillRect(2, -9, 5, 18);
+      } else if (b.id === 'weapon') {
+        for (var w = 0; w < WEAPONS.length; w++) {
+          ctx.fillStyle = p.unlocked[w] ? (w === p.weapon ? WEAPONS[w].color : 'rgba(230,247,255,0.4)') : 'rgba(230,247,255,0.1)';
+          ctx.fillRect(-11 + w * 6, -8, 4, 16);
+        }
+      } else {
+        ctx.scale(1.4, 1.4);
+        drawSkillIcon(b.id, col[b.id], G.time);
+      }
+      ctx.restore();
+    });
+  }
+
   function drawCrosshair() {
     var p = G.player;
     if (!mouse.active || touch.aimId !== null || !p) return;
@@ -3104,21 +3221,27 @@
     if (G.streak >= 5) chip('STREAK ' + G.streak, '#ffd166', clamp(G.streakT / 2.6, 0, 1));
 
     // ================= weapon rack =================
+    // on mobile the WEAPON button's pips show this, and the rack would sit under it
     var rackY = sy + sh + 34;
-    for (var wi = 0; wi < WEAPONS.length; wi++) {
+    for (var wi = 0; wi < WEAPONS.length && !G.mobile; wi++) {
       drawWeaponCard(sx, rackY, compact ? 150 : 176, 33, wi);
       rackY += 38;
     }
 
     // ================= wave strip =================
     var wsw = 188, wsh = 46, wsx = W / 2 - wsw / 2, wsy = 16;
-    // too narrow to sit between the status panel and score: drop it above the overdrive bar
-    if (wsx < sx + sw + 10) wsy = H - 100;
+    // too narrow to sit between the status panel and score: desktop drops it above the overdrive bar,
+    // mobile (bottom belongs to the sticks) tucks it under the pause button
+    if (wsx < sx + sw + 10) {
+      if (G.mobile) { wsx = W - wsw - 16; wsy = 190; }
+      else wsy = H - 100;
+    }
+    var wcx = wsx + wsw / 2;
     panel(wsx, wsy, wsw, wsh, 'rgba(125,252,255,0.45)');
-    hudText('WAVE', W / 2 - 30, wsy + 15, 8, 'rgba(125,252,255,0.6)', 'center');
-    hudText(String(G.wave).padStart(2, '0'), W / 2 + 14, wsy + 15, 17, '#e6faff', 'center');
+    hudText('WAVE', wcx - 30, wsy + 15, 8, 'rgba(125,252,255,0.6)', 'center');
+    hudText(String(G.wave).padStart(2, '0'), wcx + 14, wsy + 15, 17, '#e6faff', 'center');
     var remaining = G.enemies.length + G.spawnQueue.length;
-    hudText(remaining > 0 ? remaining + ' HOSTILES' : 'SECTOR CLEAR', W / 2, wsy + 34, 8,
+    hudText(remaining > 0 ? remaining + ' HOSTILES' : 'SECTOR CLEAR', wcx, wsy + 34, 8,
       remaining > 0 ? 'rgba(230,247,255,0.5)' : '#6ee7b7', 'center');
 
     // ================= score =================
@@ -3153,61 +3276,64 @@
       ctx.fillRect(W - 110, 104, 90 * clamp(G.comboT / 2.6, 0, 1), 3);
     }
 
-    // ================= dash =================
-    var dby = H - 66, dbx = 20;
-    for (var di = 0; di < p.dashMax; di++) {
-      var filled = di < p.dashCharges;
-      ctx.save();
-      ctx.translate(dbx + di * 15, dby);
-      ctx.beginPath();
-      ctx.moveTo(0, -8); ctx.lineTo(7, 0); ctx.lineTo(0, 8); ctx.lineTo(-3, 0);
-      ctx.closePath();
-      ctx.fillStyle = filled ? '#7dfcff' : 'rgba(125,252,255,0.13)';
-      if (filled) { ctx.shadowColor = '#7dfcff'; ctx.shadowBlur = 10; }
-      ctx.fill();
-      ctx.restore();
-    }
-    hudText('DASH', dbx + p.dashMax * 15 + 6, dby, 8, 'rgba(125,252,255,0.45)');
+    // on mobile the touch buttons show dash, mine and overdrive state, and the sticks need this space
+    if (!G.mobile) {
+      // ================= dash =================
+      var dby = H - 66, dbx = 20;
+      for (var di = 0; di < p.dashMax; di++) {
+        var filled = di < p.dashCharges;
+        ctx.save();
+        ctx.translate(dbx + di * 15, dby);
+        ctx.beginPath();
+        ctx.moveTo(0, -8); ctx.lineTo(7, 0); ctx.lineTo(0, 8); ctx.lineTo(-3, 0);
+        ctx.closePath();
+        ctx.fillStyle = filled ? '#7dfcff' : 'rgba(125,252,255,0.13)';
+        if (filled) { ctx.shadowColor = '#7dfcff'; ctx.shadowBlur = 10; }
+        ctx.fill();
+        ctx.restore();
+      }
+      hudText('DASH', dbx + p.dashMax * 15 + 6, dby, 8, 'rgba(125,252,255,0.45)');
 
-    // ================= mines =================
-    var mbx = dbx + p.dashMax * 15 + 46;
-    for (var mi = 0; mi < p.mineMax; mi++) {
-      var have = mi < p.mines;
-      ctx.save();
-      ctx.translate(mbx + mi * 14, dby);
-      ctx.strokeStyle = have ? '#fbbf24' : 'rgba(251,191,36,0.16)';
-      ctx.lineWidth = 1.8;
-      poly(ctx, 0, 0, 5.5, 6, 0);
-      ctx.stroke();
-      if (have) { ctx.fillStyle = 'rgba(251,191,36,0.6)'; ctx.fill(); }
-      ctx.restore();
-    }
-    hudText('MINES', mbx + p.mineMax * 14 + 6, dby, 8, 'rgba(251,191,36,0.45)');
+      // ================= mines =================
+      var mbx = dbx + p.dashMax * 15 + 46;
+      for (var mi = 0; mi < p.mineMax; mi++) {
+        var have = mi < p.mines;
+        ctx.save();
+        ctx.translate(mbx + mi * 14, dby);
+        ctx.strokeStyle = have ? '#fbbf24' : 'rgba(251,191,36,0.16)';
+        ctx.lineWidth = 1.8;
+        poly(ctx, 0, 0, 5.5, 6, 0);
+        ctx.stroke();
+        if (have) { ctx.fillStyle = 'rgba(251,191,36,0.6)'; ctx.fill(); }
+        ctx.restore();
+      }
+      hudText('MINES', mbx + p.mineMax * 14 + 6, dby, 8, 'rgba(251,191,36,0.45)');
 
-    // ================= overdrive bar =================
-    var ow = Math.min(300, W * 0.28), ox = W / 2 - ow / 2, oy = H - 30;
-    ctx.fillStyle = 'rgba(255,255,255,0.06)';
-    rr(ctx, ox, oy, ow, 10, 5); ctx.fill();
-    ctx.save();
-    ctx.shadowColor = '#7dfcff';
-    ctx.shadowBlur = p.odReady ? 20 : 7;
-    ctx.fillStyle = p.odActive > 0 ? '#ffffff' : (p.odReady ? '#7dfcff' : 'rgba(125,252,255,0.5)');
-    if (opct > 0) { rr(ctx, ox, oy, Math.max(4, ow * opct), 10, 5); ctx.fill(); }
-    ctx.restore();
-    ctx.strokeStyle = 'rgba(125,252,255,0.3)';
-    ctx.lineWidth = 1;
-    rr(ctx, ox, oy, ow, 10, 5); ctx.stroke();
-    if (p.odReady && p.odActive <= 0) {
+      // ================= overdrive bar =================
+      var ow = Math.min(300, W * 0.28), ox = W / 2 - ow / 2, oy = H - 30;
+      ctx.fillStyle = 'rgba(255,255,255,0.06)';
+      rr(ctx, ox, oy, ow, 10, 5); ctx.fill();
       ctx.save();
-      ctx.globalAlpha = 0.55 + 0.45 * Math.sin(G.time * 8);
-      hudText('[ Q ]  OVERDRIVE READY', W / 2, oy - 13, 9, '#7dfcff', 'center');
+      ctx.shadowColor = '#7dfcff';
+      ctx.shadowBlur = p.odReady ? 20 : 7;
+      ctx.fillStyle = p.odActive > 0 ? '#ffffff' : (p.odReady ? '#7dfcff' : 'rgba(125,252,255,0.5)');
+      if (opct > 0) { rr(ctx, ox, oy, Math.max(4, ow * opct), 10, 5); ctx.fill(); }
       ctx.restore();
-    } else if (p.odActive > 0) {
-      hudText('OVERDRIVE  ' + p.odActive.toFixed(1) + 's', W / 2, oy - 13, 9, '#bffcff', 'center');
+      ctx.strokeStyle = 'rgba(125,252,255,0.3)';
+      ctx.lineWidth = 1;
+      rr(ctx, ox, oy, ow, 10, 5); ctx.stroke();
+      if (p.odReady && p.odActive <= 0) {
+        ctx.save();
+        ctx.globalAlpha = 0.55 + 0.45 * Math.sin(G.time * 8);
+        hudText('[ Q ]  OVERDRIVE READY', W / 2, oy - 13, 9, '#7dfcff', 'center');
+        ctx.restore();
+      } else if (p.odActive > 0) {
+        hudText('OVERDRIVE  ' + p.odActive.toFixed(1) + 's', W / 2, oy - 13, 9, '#bffcff', 'center');
+      }
     }
 
     // ================= radar =================
-    if (!compact) drawRadar(W - 82, H - 84, 56);
+    if (!compact && !G.mobile) drawRadar(W - 82, H - 84, 56);
 
     // ================= toast =================
     if (G.toastT > 0) {
@@ -3436,118 +3562,293 @@
     for (var j = 0; j < lines.length; j++) ctx.fillText(lines[j], cx, cy + j * lh);
   }
 
-  // procedural icon atlas, one glyph per upgrade id
-  function drawCardGlyph(id, col, t) {
+  // ---------------------------------------------------------------- skill icons
+  // each upgrade icon is a tiny scene of its effect, drawn from the game's own art, so choices read true
+
+  function iShip(x, y, s, alpha) {
     ctx.save();
-    ctx.strokeStyle = col;
-    ctx.fillStyle = col;
-    ctx.lineWidth = 2.2;
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    ctx.beginPath();
-
-    if (id === 'dmg') {
-      ctx.moveTo(-3, -12); ctx.lineTo(7, -2); ctx.lineTo(1, 0); ctx.lineTo(4, 12);
-      ctx.lineTo(-7, 1); ctx.lineTo(-1, -1);
-      ctx.closePath(); ctx.fill();
-    } else if (id === 'rate') {
-      ctx.moveTo(-12, -7); ctx.lineTo(10, -7);
-      ctx.moveTo(-12, 0); ctx.lineTo(4, 0);
-      ctx.moveTo(-12, 7); ctx.lineTo(-2, 7);
-      ctx.stroke();
-    } else if (id === 'spd') {
-      ctx.moveTo(-11, 6); ctx.lineTo(-3, -6); ctx.lineTo(1, 6);
-      ctx.moveTo(-1, 6); ctx.lineTo(7, -6); ctx.lineTo(12, 6);
-      ctx.stroke();
-    } else if (id === 'hp') {
-      ctx.moveTo(0, -13); ctx.lineTo(11, -7); ctx.lineTo(9, 6);
-      ctx.lineTo(0, 13); ctx.lineTo(-9, 6); ctx.lineTo(-11, -7);
-      ctx.closePath(); ctx.stroke();
-    } else if (id === 'mag') {
-      ctx.arc(0, 0, 10, 0, TAU); ctx.stroke();
-      ctx.beginPath(); ctx.arc(0, 0, 4, 0, TAU); ctx.fill();
-    } else if (id === 'mine') {
-      poly(ctx, 0, 0, 11, 6, 0); ctx.stroke();
-      poly(ctx, 0, 0, 4.5, 6, 0); ctx.fill();
-    } else if (id === 'dash') {
-      ctx.moveTo(-9, -8); ctx.lineTo(0, 0); ctx.lineTo(-9, 8);
-      ctx.moveTo(1, -8); ctx.lineTo(10, 0); ctx.lineTo(1, 8);
-      ctx.stroke();
-    } else if (id === 'pierce') {
-      ctx.moveTo(-12, 0); ctx.lineTo(12, 0);
-      ctx.moveTo(4, -7); ctx.lineTo(12, 0); ctx.lineTo(4, 7);
-      ctx.stroke();
-    } else if (id === 'proj') {
-      ctx.moveTo(-9, -9); ctx.lineTo(3, -9);
-      ctx.moveTo(-9, 0); ctx.lineTo(7, 0);
-      ctx.moveTo(-9, 9); ctx.lineTo(3, 9);
-      ctx.stroke();
-    } else if (id === 'crit') {
-      ctx.arc(0, 0, 9, 0, TAU); ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(-13, 0); ctx.lineTo(-5, 0);
-      ctx.moveTo(5, 0); ctx.lineTo(13, 0);
-      ctx.moveTo(0, -13); ctx.lineTo(0, -5);
-      ctx.moveTo(0, 5); ctx.lineTo(0, 13);
-      ctx.stroke();
-    } else if (id === 'critm') {
-      ctx.arc(0, 0, 11, 0, TAU); ctx.stroke();
-      ctx.beginPath(); ctx.arc(0, 0, 4.5, 0, TAU); ctx.fill();
-    } else if (id === 'life') {
-      ctx.moveTo(0, -11); ctx.lineTo(9, 0); ctx.lineTo(0, 11); ctx.lineTo(-9, 0);
-      ctx.closePath(); ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(-3.5, -1); ctx.lineTo(-0.5, 3); ctx.lineTo(4.5, -4);
-      ctx.stroke();
-    } else if (id === 'regen') {
-      ctx.moveTo(-10, 0); ctx.lineTo(10, 0);
-      ctx.moveTo(0, -10); ctx.lineTo(0, 10);
-      ctx.stroke();
-      ctx.beginPath(); ctx.arc(0, 0, 3.5, 0, TAU); ctx.fill();
-    } else if (id === 'thorn') {
-      for (var a1 = 0; a1 < 8; a1++) {
-        var ang1 = a1 * TAU / 8;
-        ctx.moveTo(Math.cos(ang1) * 5, Math.sin(ang1) * 5);
-        ctx.lineTo(Math.cos(ang1) * 12, Math.sin(ang1) * 12);
-      }
-      ctx.stroke();
-      ctx.beginPath(); ctx.arc(0, 0, 4, 0, TAU); ctx.stroke();
-    } else if (id === 'slow') {
-      ctx.arc(0, 0, 10, 0, TAU); ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(0, 0); ctx.lineTo(0, -6);
-      ctx.moveTo(0, 0); ctx.lineTo(5, 3);
-      ctx.stroke();
-    } else if (id === 'od') {
-      poly(ctx, 0, 0, 10, 6, 0); ctx.stroke();
-      ctx.beginPath(); ctx.arc(0, 0, 3.5, 0, TAU); ctx.fill();
-    } else if (id === 'odb') {
-      ctx.moveTo(0, -12);
-      ctx.bezierCurveTo(8, -2, 6, 4, 0, 10);
-      ctx.bezierCurveTo(-6, 4, -8, -2, 0, -12);
-      ctx.fill();
-    } else if (id === 'expl') {
-      for (var a2 = 0; a2 < 8; a2++) {
-        var ang2 = a2 * TAU / 8 + 0.2;
-        ctx.moveTo(Math.cos(ang2) * 4, Math.sin(ang2) * 4);
-        ctx.lineTo(Math.cos(ang2) * 12, Math.sin(ang2) * 12);
-      }
-      ctx.stroke();
-      ctx.beginPath(); ctx.arc(0, 0, 3, 0, TAU); ctx.fill();
-    } else if (id === 'richo') {
-      ctx.moveTo(-11, 8); ctx.lineTo(-3, -2); ctx.lineTo(3, 4); ctx.lineTo(11, -8);
-      ctx.stroke();
-    } else if (id === 'wave') {
-      ctx.moveTo(-11, 6); ctx.lineTo(-11, -2);
-      ctx.quadraticCurveTo(-7, -12, -3, -2);
-      ctx.quadraticCurveTo(1, 8, 5, -2);
-      ctx.quadraticCurveTo(9, -12, 11, 6);
-      ctx.stroke();
-    } else {
-      poly(ctx, 0, 0, 10, 6, t * 0.6); ctx.stroke();
-    }
-
+    ctx.translate(x, y); ctx.scale(s, s);
+    ctx.globalAlpha *= alpha === undefined ? 1 : alpha;
+    ctx.fillStyle = PLAYER_LOOK.hull;
+    ctx.strokeStyle = PLAYER_LOOK.trim;
+    ctx.lineWidth = 1.4;
+    shipPath(ctx); ctx.fill(); ctx.stroke();
     ctx.restore();
+  }
+
+  function iEnemy(x, y, r) {
+    ctx.save();
+    ctx.translate(x, y); ctx.rotate(Math.PI);
+    ctx.fillStyle = '#2a0b14';
+    ctx.strokeStyle = ETYPES.grunt.color;
+    ctx.lineWidth = 1.3;
+    enemyOutline(ctx, 'grunt', r); ctx.fill(); ctx.stroke();
+    ctx.restore();
+  }
+
+  function iBullet(x, y, ang, len, rad) {
+    ctx.save();
+    ctx.translate(x, y); ctx.rotate(ang);
+    ctx.fillStyle = PLAYER_LOOK.engine;
+    ctx.beginPath(); ctx.ellipse(0, 0, len, rad, 0, 0, TAU); ctx.fill();
+    ctx.restore();
+  }
+
+  function iSpark(x, y, r, col) {
+    ctx.save();
+    ctx.strokeStyle = col; ctx.lineWidth = 1.6; ctx.lineCap = 'round';
+    ctx.beginPath();
+    for (var i = 0; i < 4; i++) {
+      var a = i * Math.PI / 4;
+      ctx.moveTo(x - Math.cos(a) * r, y - Math.sin(a) * r);
+      ctx.lineTo(x + Math.cos(a) * r, y + Math.sin(a) * r);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function iHeart(x, y, s, col) {
+    ctx.save();
+    ctx.translate(x, y); ctx.scale(s, s);
+    ctx.fillStyle = col;
+    ctx.beginPath();
+    ctx.moveTo(0, 3);
+    ctx.bezierCurveTo(-6, -1, -4, -6, 0, -3);
+    ctx.bezierCurveTo(4, -6, 6, -1, 0, 3);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function iPlus(x, y, r, col) {
+    ctx.save();
+    ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(x - r, y); ctx.lineTo(x + r, y);
+    ctx.moveTo(x, y - r); ctx.lineTo(x, y + r);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function iBolt(x, y, ang, len, col) {
+    ctx.save();
+    ctx.translate(x, y); ctx.rotate(ang);
+    ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.lineJoin = 'round';
+    ctx.beginPath();
+    ctx.moveTo(0, 0); ctx.lineTo(len * 0.45, -2); ctx.lineTo(len * 0.55, 2); ctx.lineTo(len, 0);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function iCrosshair(x, y, r, col) {
+    ctx.save();
+    ctx.strokeStyle = col; ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x - r - 3, y); ctx.lineTo(x - r + 3, y);
+    ctx.moveTo(x + r - 3, y); ctx.lineTo(x + r + 3, y);
+    ctx.moveTo(x, y - r - 3); ctx.lineTo(x, y - r + 3);
+    ctx.moveTo(x, y + r - 3); ctx.lineTo(x, y + r + 3);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  var SKILL_ICONS = {
+    spd: function (col) {
+      ctx.save();
+      ctx.fillStyle = withAlpha(PLAYER_LOOK.engine, 0.9);
+      ctx.beginPath(); ctx.moveTo(-5, -2.5); ctx.lineTo(-14, 0); ctx.lineTo(-5, 2.5); ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = col; ctx.lineWidth = 1.4; ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(-12, -8); ctx.lineTo(-3, -8);
+      ctx.moveTo(-12, 8); ctx.lineTo(-3, 8);
+      ctx.stroke();
+      ctx.restore();
+      iShip(3, 0, 0.55);
+    },
+    rate: function (col) {
+      for (var i = 0; i < 3; i++) iBullet(-8 + i * 8, 0, 0, 3.5, 1.8);
+      ctx.save();
+      ctx.strokeStyle = col; ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(-6, -8); ctx.lineTo(-2, -5); ctx.lineTo(2, -8);
+      ctx.moveTo(-6, 8); ctx.lineTo(-2, 5); ctx.lineTo(2, 8);
+      ctx.stroke();
+      ctx.restore();
+    },
+    dmg: function (col) {
+      iBullet(-4, 0, 0, 8, 4);
+      iSpark(8, 0, 6, col);
+    },
+    hp: function (col) {
+      ctx.save();
+      ctx.fillStyle = withAlpha(col, 0.3);
+      ctx.strokeStyle = col; ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      ctx.moveTo(0, -11); ctx.lineTo(9, -7); ctx.lineTo(8, 4); ctx.lineTo(0, 11); ctx.lineTo(-8, 4); ctx.lineTo(-9, -7);
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+      ctx.restore();
+      iPlus(0, 0, 4, '#ffffff');
+    },
+    mag: function (col) {
+      iShip(-7, 0, 0.42);
+      ctx.save();
+      ctx.strokeStyle = col; ctx.lineWidth = 1.3;
+      ctx.beginPath(); ctx.arc(-4, 0, 9, -0.6, 0.6); ctx.stroke();
+      ctx.beginPath(); ctx.arc(-4, 0, 13, -0.45, 0.45); ctx.stroke();
+      ctx.fillStyle = '#4ade80';
+      ctx.beginPath(); ctx.moveTo(9, -5); ctx.lineTo(12, 0); ctx.lineTo(9, 5); ctx.lineTo(6, 0); ctx.closePath(); ctx.fill();
+      ctx.restore();
+    },
+    mine: function (col) {
+      ctx.save();
+      ctx.strokeStyle = '#fbbf24'; ctx.lineWidth = 2;
+      poly(ctx, 0, 0, 8, 6, 0); ctx.stroke();
+      ctx.fillStyle = '#fbbf24';
+      poly(ctx, 0, 0, 3.6, 6, Math.PI / 6); ctx.fill();
+      ctx.globalAlpha = 0.5; ctx.strokeStyle = col; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(0, 0, 12, 0, TAU); ctx.stroke();
+      ctx.restore();
+    },
+    dash: function (col) {
+      iShip(-9, 0, 0.5, 0.2);
+      iShip(-2, 0, 0.5, 0.45);
+      iShip(6, 0, 0.5);
+      iSpark(-12, 0, 2, col);
+    },
+    pierce: function (col) {
+      iEnemy(-3, 0, 5);
+      iEnemy(6, 0, 5);
+      ctx.save();
+      ctx.strokeStyle = col; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(-14, 0); ctx.lineTo(11, 0); ctx.stroke();
+      ctx.restore();
+      iBullet(12, 0, 0, 3, 2);
+    },
+    proj: function (col) {
+      ctx.save();
+      ctx.fillStyle = col;
+      ctx.beginPath(); ctx.arc(-10, 0, 2.4, 0, TAU); ctx.fill();
+      ctx.restore();
+      [-0.45, 0, 0.45].forEach(function (a) { iBullet(-10 + Math.cos(a) * 15, Math.sin(a) * 15, a, 3.5, 1.8); });
+    },
+    crit: function (col) {
+      iEnemy(0, 0, 6);
+      iCrosshair(0, 0, 8, col);
+    },
+    critm: function (col) {
+      iEnemy(-2, 2, 7);
+      ctx.save();
+      ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.moveTo(-6, -1); ctx.lineTo(-2, 2); ctx.lineTo(-4, 5); ctx.lineTo(1, 8); ctx.stroke();
+      ctx.restore();
+      iSpark(5, -5, 7, col);
+    },
+    life: function (col) {
+      iEnemy(-8, -6, 4);
+      ctx.save();
+      ctx.strokeStyle = col; ctx.lineWidth = 1.4; ctx.setLineDash([2, 2]);
+      ctx.beginPath(); ctx.moveTo(-5, -3); ctx.lineTo(3, 3); ctx.stroke();
+      ctx.restore();
+      iHeart(6, 5, 1.3, '#f43f5e');
+    },
+    regen: function (col) {
+      iHeart(0, -1, 1.6, '#6ee7b7');
+      iPlus(0, -2, 2.5, '#ffffff');
+      ctx.save();
+      ctx.strokeStyle = col; ctx.lineWidth = 1.3;
+      ctx.beginPath();
+      ctx.moveTo(-12, 9); ctx.lineTo(-4, 9); ctx.lineTo(-2, 5); ctx.lineTo(1, 12); ctx.lineTo(3, 9); ctx.lineTo(12, 9);
+      ctx.stroke();
+      ctx.restore();
+    },
+    thorn: function (col) {
+      ctx.save();
+      ctx.globalAlpha = 0.55; ctx.strokeStyle = '#f97316'; ctx.lineWidth = 1.4;
+      ctx.beginPath(); ctx.arc(0, 0, 12, 0, TAU); ctx.stroke();
+      ctx.globalAlpha = 1; ctx.strokeStyle = col; ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      for (var i = 0; i < 8; i++) {
+        var a = i * TAU / 8;
+        ctx.moveTo(Math.cos(a) * 7, Math.sin(a) * 7);
+        ctx.lineTo(Math.cos(a) * 10, Math.sin(a) * 10);
+      }
+      ctx.stroke();
+      ctx.restore();
+      iShip(0, 0, 0.4);
+    },
+    slow: function (col) {
+      iEnemy(-3, 3, 7);
+      ctx.save();
+      ctx.fillStyle = '#0b1220'; ctx.strokeStyle = col; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(6, -6, 6, 0, TAU); ctx.fill(); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(6, -6); ctx.lineTo(6, -10); ctx.moveTo(6, -6); ctx.lineTo(9, -5); ctx.stroke();
+      ctx.restore();
+    },
+    od: function (col) {
+      ctx.save();
+      ctx.fillStyle = withAlpha(col, 0.35);
+      ctx.beginPath(); ctx.arc(0, 0, 6, 0, TAU); ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath(); ctx.arc(0, 0, 2.8, 0, TAU); ctx.fill();
+      ctx.restore();
+      for (var i = 0; i < 4; i++) iBolt(Math.cos(i * TAU / 4 + 0.6) * 6, Math.sin(i * TAU / 4 + 0.6) * 6, i * TAU / 4 + 0.6, 7, col);
+    },
+    odb: function (col) {
+      ctx.save();
+      ctx.fillStyle = withAlpha(col, 0.35);
+      ctx.beginPath(); ctx.arc(-5, -3, 5, 0, TAU); ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath(); ctx.arc(-5, -3, 2.2, 0, TAU); ctx.fill();
+      ctx.strokeStyle = col; ctx.lineWidth = 1.2;
+      rr(ctx, -12, 6, 24, 5, 2); ctx.stroke();
+      ctx.fillStyle = col;
+      rr(ctx, -12, 6, 20, 5, 2); ctx.fill();
+      ctx.restore();
+      iBolt(1, -3, 0, 10, col);
+    },
+    expl: function (col) {
+      iBullet(-8, 5, -0.5, 3.5, 1.8);
+      ctx.save();
+      ctx.fillStyle = withAlpha('#fdba74', 0.35);
+      ctx.beginPath(); ctx.arc(4, -3, 7, 0, TAU); ctx.fill();
+      ctx.strokeStyle = col; ctx.lineWidth = 1.6;
+      ctx.beginPath(); ctx.arc(4, -3, 8.5, 0, TAU); ctx.stroke();
+      ctx.restore();
+      iSpark(4, -3, 4, '#ffffff');
+    },
+    richo: function (col) {
+      iEnemy(-7, 7, 4);
+      iEnemy(7, 7, 4);
+      ctx.save();
+      ctx.strokeStyle = col; ctx.lineWidth = 1.4; ctx.setLineDash([3, 2]);
+      ctx.beginPath(); ctx.moveTo(-13, -9); ctx.lineTo(-7, 3); ctx.lineTo(0, -7); ctx.lineTo(7, 3); ctx.stroke();
+      ctx.restore();
+      iBullet(-13, -9, 1.1, 2.5, 1.6);
+    },
+    wave: function (col) {
+      ctx.save();
+      ctx.fillStyle = withAlpha('#60a5fa', 0.15);
+      ctx.strokeStyle = '#60a5fa'; ctx.lineWidth = 1.8;
+      ctx.beginPath(); ctx.arc(0, 0, 11, 0, TAU); ctx.fill(); ctx.stroke();
+      ctx.strokeStyle = col; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(0, 0, 11, -2.4, -1.2); ctx.stroke();
+      ctx.restore();
+      iShip(0, 0, 0.42);
+    }
+  };
+
+  // returns false when the id has no icon (draws a generic hexagon instead)
+  function drawSkillIcon(id, col, t) {
+    var fn = SKILL_ICONS[id];
+    ctx.save();
+    ctx.fillStyle = withAlpha(col, 0.12);
+    rr(ctx, -14, -14, 28, 28, 6); ctx.fill();
+    ctx.strokeStyle = withAlpha(col, 0.6); ctx.lineWidth = 1;
+    rr(ctx, -14, -14, 28, 28, 6); ctx.stroke();
+    if (fn) fn(col);
+    else { ctx.strokeStyle = col; ctx.lineWidth = 2; poly(ctx, 0, 0, 10, 6, t * 0.6); ctx.stroke(); }
+    ctx.restore();
+    return !!fn;
   }
 
   function drawUpgrade() {
@@ -3629,7 +3930,7 @@
       ctx.arc(0, 0, 26, 0, TAU);
       ctx.fill();
       ctx.globalAlpha = 1;
-      drawCardGlyph(c.id, col, G.time);
+      drawSkillIcon(c.id, col, G.time);
       ctx.restore();
       ctx.textAlign = 'center';
       ctx.fillStyle = '#e6faff';
@@ -3799,7 +4100,7 @@
     var ctaY = py0 + ph + 36;
     ctx.save();
     ctx.globalAlpha = 0.55 + 0.45 * Math.sin(t * 5);
-    hudText('CLICK  OR  PRESS  ENTER  TO  LAUNCH', W / 2, ctaY, 15, '#7dfcff', 'center');
+    hudText(G.mobile ? 'TAP  TO  LAUNCH' : 'CLICK  OR  PRESS  ENTER  TO  LAUNCH', W / 2, ctaY, 15, '#7dfcff', 'center');
     ctx.restore();
 
     // records strip
@@ -3932,7 +4233,7 @@
       rr(ctx, gx - 15, gy - 15, 30, 30, 6); ctx.fill();
       ctx.translate(gx, gy);
       ctx.scale(0.8, 0.8);
-      drawCardGlyph(cc.id, col, G.time);
+      drawSkillIcon(cc.id, col, G.time);
       ctx.restore();
       var n = cardStacks(p, cc.id);
       if (n > 1) hudText('x' + n, gx + 14, gy + 12, 8, '#ffffff', 'right');
@@ -3952,7 +4253,7 @@
     ctx.shadowBlur = 0;
     ctx.font = '13px ui-monospace, monospace';
     ctx.fillStyle = 'rgba(230,247,255,0.7)';
-    ctx.fillText('PRESS  P  OR  ESC  TO  RESUME', W / 2, 108);
+    ctx.fillText(G.mobile ? 'TAP  ANYWHERE  TO  RESUME' : 'PRESS  P  OR  ESC  TO  RESUME', W / 2, 108);
     var pw = Math.min(330, (W - 52) / 2);
     if (W < 700) {
       drawBuildPanel(W / 2 - Math.min(340, W - 32) / 2, 136, Math.min(340, W - 32), 1);
@@ -4015,7 +4316,7 @@
     if (G.gameOverT > 0.8) {
       ctx.font = 'bold 15px ui-monospace, monospace';
       ctx.fillStyle = 'rgba(125,252,255,' + (0.55 + 0.45 * Math.sin(G.time * 6)) + ')';
-      ctx.fillText('CLICK  OR  PRESS  ENTER  TO  REDEPLOY', W / 2, Math.min(H - 24, top + ph + 34));
+      ctx.fillText(G.mobile ? 'TAP  TO  REDEPLOY' : 'CLICK  OR  PRESS  ENTER  TO  REDEPLOY', W / 2, Math.min(H - 24, top + ph + 34));
     }
     ctx.restore();
   }
@@ -4190,6 +4491,7 @@
     }
 
     if (G.state === 'playing') drawCrosshair();
+    if (G.state === 'playing' && G.mobile) drawTouchControls();
 
     // hide the OS cursor while the in-game crosshair is shown
     var wantNoCursor = G.state === 'playing' && mouse.active;
@@ -4239,7 +4541,8 @@
       spawnEnemy: spawnEnemy, killEnemy: killEnemy, CARDS: CARDS, WEAPONS: WEAPONS,
       frame: frame, gainXp: gainXp, makeElite: makeElite, AFFIXES: AFFIXES, MUTATORS: MUTATORS,
       toggleMutator: toggleMutator, startGame: startGame, hurtPlayer: hurtPlayer,
-      drawCraft: drawCraft, steerBank: steerBank, enemyOutline: enemyOutline, ETYPES: ETYPES, BOSSES: BOSSES, PLAYER_LOOK: PLAYER_LOOK
+      drawCraft: drawCraft, steerBank: steerBank, enemyOutline: enemyOutline, ETYPES: ETYPES, BOSSES: BOSSES, PLAYER_LOOK: PLAYER_LOOK, drawSkillIcon: drawSkillIcon,
+      resize: resize, touchLayout: touchLayout, touchButtonAt: touchButtonAt, pressTouchButton: pressTouchButton, nextWeapon: nextWeapon
     };
   }
   loadRecords();
