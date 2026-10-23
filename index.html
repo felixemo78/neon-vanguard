@@ -305,8 +305,10 @@
       noiseSweep(0.2, 0.18, 'lowpass', 1800, 200, 1, 0, 0.2);
     },
     dash: function () {
-      noiseSweep(0.18, 0.12, 'bandpass', 600, 4200, 2.5, 0, 0.2);
-      tone(420, 0.14, 'sine', 0.06, 1500);
+      // jet burst: rising whoosh over a short thrust kick
+      noiseSweep(0.22, 0.22, 'bandpass', 500, 5200, 2.2, 0, 0.25);
+      tone(380, 0.16, 'sine', 0.12, 1600);
+      tone(110, 0.1, 'sine', 0.16, 60);
     },
     power: function () {
       [660, 990, 1320].forEach(function (f, i) { tone(f, 0.12 + i * 0.04, 'triangle', 0.12, null, i * 0.07, 0.3); });
@@ -326,6 +328,8 @@
       tone(330, 0.55, 'sine', 0.1, 1320, 0.05, 0.3);
       noiseSweep(0.5, 0.12, 'bandpass', 400, 6000, 1.5, 0, 0.3);
       tone(55, 0.6, 'sine', 0.18, 110);
+      // time slows: deep descending whoomp under the charge-up
+      tone(160, 0.9, 'sine', 0.2, 40, 0.05, 0.4);
     },
     gameover: function () {
       tone(300, 0.9, 'sawtooth', 0.12, 50, 0, 0.4);
@@ -335,7 +339,14 @@
     ui: function () { tone(880, 0.05, 'triangle', 0.07, null, 0, 0.1); tone(1760, 0.03, 'sine', 0.03); },
     card: function () { [523, 784, 1046].forEach(function (f, i) { tone(f, 0.08 + i * 0.03, 'triangle', 0.1, null, i * 0.06, 0.3); }); },
     unlock: function () { [392, 587, 784, 1175].forEach(function (f, i) { tone(f, i === 3 ? 0.4 : 0.12, 'triangle', 0.11, null, i * 0.1, 0.35); }); },
-    mine: function () { tone(180, 0.12, 'sine', 0.12, 60); noiseSweep(0.05, 0.06, 'bandpass', 2400, 1200, 6); },
+    // heavy clunk as it hits the deck, then a latch click
+    mine: function () { tone(150, 0.14, 'sine', 0.22, 55); noiseSweep(0.06, 0.14, 'lowpass', 1800, 300, 1); tone(2200, 0.03, 'square', 0.05, null, 0.07); },
+    // two rising beeps when a mine goes live
+    mineArm: function () { tone(1320, 0.05, 'square', 0.05, null, 0, 0.2); tone(1760, 0.07, 'square', 0.05, null, 0.07, 0.2); },
+    // time unwinding: a falling sweep as overdrive ends
+    odEnd: function () { tone(880, 0.45, 'sawtooth', 0.07, 160, 0, 0.35); noiseSweep(0.4, 0.08, 'bandpass', 5000, 400, 1.5, 0, 0.3); },
+    // short low buzz when a skill isn't ready
+    denied: function () { if (!throttle('denied', 0.15)) return; tone(140, 0.07, 'square', 0.07); tone(120, 0.08, 'square', 0.07, null, 0.08); },
     laser: function () {
       tone(1600, 0.16, 'sawtooth', 0.06, 260, 0, 0.2);
       tone(800, 0.16, 'square', 0.035, 130);
@@ -1226,7 +1237,8 @@
   // ---------------------------------------------------------------- player powers
   function tryOverdrive() {
     var p = G.player;
-    if (!p || p.odActive > 0 || !p.odReady) return;
+    if (!p || p.odActive > 0) return;
+    if (!p.odReady) { sfx.denied(); return; }
     p.odReady = false;
     p.odCharge = 0;
     p.odActive = 7 + p.odBonus;
@@ -1544,7 +1556,8 @@
   // ---------------------------------------------------------------- mines
   function placeMine() {
     var p = G.player;
-    if (!p || p.dead || p.mines <= 0) return;
+    if (!p || p.dead) return;
+    if (p.mines <= 0) { sfx.denied(); return; }
     p.mines--;
     G.mines.push({ x: p.x, y: p.y, r: 12, arm: 0.35, life: 26, bob: Math.random() * TAU });
     sfx.mine();
@@ -1564,7 +1577,9 @@
     for (var i = G.mines.length - 1; i >= 0; i--) {
       var m = G.mines[i];
       m.bob += dt * 4;
+      var wasArmed = m.arm <= 0;
       m.arm -= dt;
+      if (!wasArmed && m.arm <= 0) sfx.mineArm();
       m.life -= dt;
       if (m.life <= 0) { G.mines.splice(i, 1); continue; }
       if (m.arm > 0) continue;
@@ -1872,7 +1887,7 @@
     }
     if (p.odActive > 0) {
       p.odActive -= dt;
-      if (p.odActive <= 0) { p.odActive = 0; addText(p.x, p.y - 30, 'OVERDRIVE END', '#7dfcff', 15); }
+      if (p.odActive <= 0) { p.odActive = 0; addText(p.x, p.y - 30, 'OVERDRIVE END', '#7dfcff', 15); sfx.odEnd(); }
     }
 
     var inp = playerInputVector();
@@ -1907,6 +1922,7 @@
     // a queued press is always a fresh press, even if the old latch never saw the release
     var wantDash = dashQueued || (held && !p.dashLatch);
     dashQueued = false;
+    if (wantDash && p.dashCharges <= 0) sfx.denied();
     if (wantDash && p.dashCharges > 0 && p.dashT <= 0) {
       var dirx = inp.x, diry = inp.y;
       if (len(dirx, diry) < 0.1) { dirx = Math.cos(p.angle); diry = Math.sin(p.angle); }
